@@ -1,3 +1,5 @@
 streamlit
-anthropic
+openai
 tavily-python
+beautifulsoup4
+requests
