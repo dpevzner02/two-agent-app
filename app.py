@@ -1,232 +1,261 @@
 """
-app.py — Web version of the two-agent pipeline (Researcher -> Critic -> Reviser).
+app.py — Model-comparison research pipeline (deployable to Streamlit Cloud).
 
-This is the SAME pipeline logic from agent_pipeline.py, with two changes
-that make it cloud-deployable:
+This is the culmination of everything built so far:
+  - Two-agent pipeline (Researcher -> Critic -> Reviser)
+  - Running on OpenRouter (open-weight OR closed models, one API)
+  - With TWO tools: web_search + fetch_page (read full pages)
+  - NEW: run the SAME question through SEVERAL models side by side, so you
+    can directly compare answer quality, citations, and speed.
 
-  1. The terminal input()/print() loop is replaced by a Streamlit web UI
-     (a text box, a button, and live status updates). Cloud apps have no
-     terminal to type into — they have a web page instead.
+The design change that makes comparison possible: `model` is now a PARAMETER
+threaded through every function, instead of a global constant. That single
+change is what lets one run drive many models.
 
-  2. API keys are read from Streamlit secrets OR environment variables,
-     so the SAME code runs locally (env vars) and on the cloud (secrets),
-     without ever hardcoding a key into the file.
-
-Run locally with:   streamlit run app.py
-Deploy by pushing this + requirements.txt to GitHub, then deploying on
-Streamlit Community Cloud (free).
+SECRETS NEEDED (set locally as env vars, or in Streamlit Cloud -> Secrets):
+    OPENROUTER_API_KEY   — get free at openrouter.ai/keys
+    TAVILY_API_KEY       — get free at tavily.com
 """
 
 import os
+import json
+import time
+import requests
 import streamlit as st
-from anthropic import Anthropic
+from bs4 import BeautifulSoup
+from openai import OpenAI
 from tavily import TavilyClient
 
-MODEL = "claude-sonnet-4-6"
-
 
 # ---------------------------------------------------------------------------
-# API KEYS — works in BOTH environments.
-# Locally: reads the environment variables you already set with setx.
-# On Streamlit Cloud: reads the secrets you paste into the deploy dialog.
-# st.secrets behaves like a dict; we copy any keys it has into os.environ
-# so the Anthropic and Tavily SDKs (which read env vars) pick them up.
+# SECRETS — works locally (env vars) and on Streamlit Cloud (secrets store).
 # ---------------------------------------------------------------------------
-for key_name in ("ANTHROPIC_API_KEY", "TAVILY_API_KEY"):
+for key_name in ("OPENROUTER_API_KEY", "TAVILY_API_KEY"):
     if key_name not in os.environ:
         try:
             os.environ[key_name] = st.secrets[key_name]
         except Exception:
-            pass  # not in secrets either; we'll catch the missing key below
+            pass
 
-# Fail clearly if keys are missing, instead of a cryptic SDK error.
-missing = [k for k in ("ANTHROPIC_API_KEY", "TAVILY_API_KEY") if not os.environ.get(k)]
+missing = [k for k in ("OPENROUTER_API_KEY", "TAVILY_API_KEY") if not os.environ.get(k)]
 if missing:
     st.error(
-        f"Missing API key(s): {', '.join(missing)}. "
-        "Set them as environment variables locally, or in the app's "
-        "Secrets settings on Streamlit Cloud."
+        f"Missing API key(s): {', '.join(missing)}. Set them as environment "
+        "variables locally, or in the app's Secrets settings on Streamlit Cloud."
     )
     st.stop()
 
-client = Anthropic()
+client = OpenAI(
+    base_url="https://openrouter.ai/api/v1",
+    api_key=os.environ["OPENROUTER_API_KEY"],
+)
 tavily_client = TavilyClient()
 
 
 # ===========================================================================
-# PIPELINE LOGIC — unchanged from agent_pipeline.py, except print() calls
-# are replaced with an optional status callback so the web UI can show
-# progress. The agent reasoning is identical.
+# TOOLS  (web_search via Tavily, fetch_page via requests+BeautifulSoup)
 # ===========================================================================
 def web_search_tool(query: str) -> str:
     try:
-        response = tavily_client.search(query=query, max_results=3, search_depth="basic")
+        response = tavily_client.search(query=query, max_results=4, search_depth="basic")
     except Exception as e:
         return f"Search failed: {e}"
     results = response.get("results", [])
     if not results:
         return f"No results found for '{query}'."
     return "\n\n".join(
-        f"- {r.get('title', 'Untitled')}\n  {r.get('content', '')}\n  Source: {r.get('url', '')}"
+        f"- {r.get('title', 'Untitled')}\n  {r.get('content', '')}\n  URL: {r.get('url', '')}"
         for r in results
     )
 
 
+def fetch_page_tool(url: str, max_chars: int = 6000) -> str:
+    try:
+        resp = requests.get(url, timeout=15,
+                            headers={"User-Agent": "Mozilla/5.0 (research-agent)"})
+        resp.raise_for_status()
+    except Exception as e:
+        return f"Could not fetch {url}: {e}"
+    soup = BeautifulSoup(resp.text, "html.parser")
+    for tag in soup(["script", "style", "nav", "footer", "header", "aside", "title"]):
+        tag.decompose()
+    lines = [ln.strip() for ln in soup.get_text(separator="\n").splitlines()]
+    clean = "\n".join(ln for ln in lines if ln)
+    if len(clean) > max_chars:
+        clean = clean[:max_chars] + "\n\n[...truncated...]"
+    return f"Full text of {url}:\n\n{clean}"
+
+
 tools = [
-    {
+    {"type": "function", "function": {
         "name": "web_search",
-        "description": "Search the web for current information on a topic.",
-        "input_schema": {
-            "type": "object",
-            "properties": {"query": {"type": "string", "description": "The search query"}},
-            "required": ["query"],
-        },
-    }
+        "description": "Search the web. Returns titles, snippets, and URLs. Use first.",
+        "parameters": {"type": "object",
+                       "properties": {"query": {"type": "string", "description": "The search query"}},
+                       "required": ["query"]}}},
+    {"type": "function", "function": {
+        "name": "fetch_page",
+        "description": "Fetch the full readable text of a web page by URL. Use after "
+                       "web_search to read a promising source in depth.",
+        "parameters": {"type": "object",
+                       "properties": {"url": {"type": "string", "description": "The full URL to fetch"}},
+                       "required": ["url"]}}},
 ]
 
 
-def run_agent_loop(system_prompt, user_content, use_tools=True, max_steps=8,
-                   max_tokens=2000, label="AGENT", status=None):
-    """`status` is an optional function(str) the UI uses to show progress."""
-    def report(msg):
-        if status:
-            status(msg)
+def execute_tool(name, args):
+    if name == "web_search":
+        return web_search_tool(args.get("query", ""))
+    if name == "fetch_page":
+        return fetch_page_tool(args.get("url", ""))
+    return f"Unknown tool: {name}"
 
-    messages = [{"role": "user", "content": user_content}]
 
+# ===========================================================================
+# AGENT LOOP — note `model` is now the FIRST parameter. This is the change
+# that makes model comparison possible.
+# ===========================================================================
+def run_agent_loop(model, system_prompt, user_content, use_tools=True, max_steps=8):
+    messages = [
+        {"role": "system", "content": system_prompt},
+        {"role": "user", "content": user_content},
+    ]
     for step in range(max_steps):
-        is_last_step = (step == max_steps - 1)
-        allow_tools = use_tools and not is_last_step
-
-        kwargs = {"model": MODEL, "max_tokens": max_tokens,
-                  "system": system_prompt, "messages": messages}
-        if allow_tools:
+        is_last = (step == max_steps - 1)
+        kwargs = {"model": model, "messages": messages, "max_tokens": 2000}
+        if use_tools and not is_last:
             kwargs["tools"] = tools
 
-        response = client.messages.create(**kwargs)
-        messages.append({"role": "assistant", "content": response.content})
+        response = client.chat.completions.create(**kwargs)
+        msg = response.choices[0].message
 
-        tool_calls = [b for b in response.content if b.type == "tool_use"]
-        if not tool_calls:
-            text = "".join(b.text for b in response.content if b.type == "text")
+        if not msg.tool_calls:
+            text = msg.content or ""
             if text.strip():
                 return text
-            report(f"[{label}] empty response (stop_reason={response.stop_reason}); retrying.")
             messages.append({"role": "user",
-                             "content": "You returned an empty response. Please write your answer now as plain text."})
-            retry = client.messages.create(model=MODEL, max_tokens=max_tokens,
-                                           system=system_prompt, messages=messages)
-            retry_text = "".join(b.text for b in retry.content if b.type == "text")
-            if retry_text.strip():
-                return retry_text
-            return f"(no answer produced; stop_reason={retry.stop_reason})"
+                             "content": "You returned nothing. Write your answer now as plain text."})
+            retry = client.chat.completions.create(model=model, messages=messages, max_tokens=2000)
+            return retry.choices[0].message.content or "(no answer produced)"
 
-        tool_results = []
-        for call in tool_calls:
-            q = call.input.get("query", "")
-            report(f"[{label}] searching: {q}")
-            result = web_search_tool(call.input["query"]) if call.name == "web_search" else "Unknown tool"
-            tool_results.append({"type": "tool_result", "tool_use_id": call.id, "content": result})
-        messages.append({"role": "user", "content": tool_results})
-
+        messages.append(msg)
+        for tc in msg.tool_calls:
+            try:
+                args = json.loads(tc.function.arguments)
+            except json.JSONDecodeError:
+                args = {}
+            result = execute_tool(tc.function.name, args)
+            messages.append({"role": "tool", "tool_call_id": tc.id, "content": result})
     return "(agent could not produce a final answer)"
 
 
 RESEARCHER_PROMPT = (
-    "You are a research assistant. Use the web_search tool to gather facts, "
-    "then write a clear, well-supported answer to the user's question. "
-    "Cite sources inline where you can."
+    "You are a research assistant. First use web_search to find sources, then "
+    "use fetch_page to read the most promising one or two in full before writing. "
+    "Produce a clear, well-supported answer with inline source URLs."
 )
 CRITIC_PROMPT = (
-    "You are a sharp, skeptical fact-checker. You will be given a QUESTION "
-    "and a DRAFT ANSWER written by someone else. Your ONLY job is to critique "
-    "the draft -- do NOT rewrite it or answer the question yourself. "
-    "List specific problems: unsupported claims, factual errors, vague "
-    "statements, missing context, or gaps. Be concise and use a numbered list."
+    "You are a sharp, skeptical fact-checker. You are given a QUESTION and a DRAFT "
+    "ANSWER by someone else. Your ONLY job is to critique the draft -- do NOT rewrite "
+    "it or answer yourself. List specific problems: unsupported claims, factual "
+    "errors, vague statements, missing context. Numbered list, concise."
 )
 REVISER_PROMPT = (
-    "You are a research assistant revising your own earlier draft. You will "
-    "be given the original QUESTION, your DRAFT, and a CRITIQUE of that draft. "
-    "Use the web_search tool to fill any gaps the critique identified, then "
-    "produce an improved FINAL answer that addresses the critique. Output only "
-    "the final answer."
+    "You are revising your own earlier draft. You are given the QUESTION, your DRAFT, "
+    "and a CRITIQUE. Use web_search and fetch_page to fill the gaps, then produce an "
+    "improved FINAL answer with source URLs. Output only the final answer."
 )
 
 
-# ===========================================================================
-# THE WEB UI — this replaces the old `if __name__ == "__main__"` input loop.
-# ===========================================================================
-st.set_page_config(page_title="Two-Agent Research Pipeline", page_icon="🔎")
-st.title("🔎 Two-Agent Research Pipeline")
-st.caption("Researcher → Critic → Reviser. Each stage is a separate AI agent.")
-
-
-def signed_in_as():
-    """
-    Return a human-readable 'who is signed in' string, degrading gracefully.
-
-    IMPORTANT: since Streamlit 1.42, st.user only exposes a viewer's email
-    if you've configured a full identity provider (Google OIDC) in secrets.
-    With the plain viewer allow-list (no OIDC), st.user has no email -- so
-    we must NOT assume st.user.email exists, or the app crashes. This helper
-    tries several safe paths and falls back to a neutral message.
-    """
+def run_for_model(model, question, full_pipeline=True):
+    """Run one model and return its result + timing, catching errors so one
+    failing model doesn't break the whole comparison."""
+    start = time.time()
     try:
-        user = st.user  # may be an empty dict-like object
-        # .get works because st.user inherits from dict
-        email = user.get("email") if hasattr(user, "get") else None
-        if email:
-            return f"Signed in as **{email}**"
-        name = user.get("name") if hasattr(user, "get") else None
-        if name:
-            return f"Signed in as **{name}**"
-    except Exception:
-        pass
-    # No identifiable info available (allow-list without OIDC, or running
-    # locally). Still confirms the page loaded for an authenticated viewer.
-    return "Signed in via Streamlit (email shown only with full OIDC auth)"
+        draft = run_agent_loop(model, RESEARCHER_PROMPT, question)
+        if not full_pipeline:
+            return {"final": draft, "draft": None, "critique": None,
+                    "elapsed": time.time() - start, "error": None}
+
+        critic_input = f"QUESTION:\n{question}\n\nDRAFT ANSWER:\n{draft}"
+        critique = run_agent_loop(model, CRITIC_PROMPT, critic_input, use_tools=False)
+
+        reviser_input = f"QUESTION:\n{question}\n\nYOUR DRAFT:\n{draft}\n\nCRITIQUE:\n{critique}"
+        final = run_agent_loop(model, REVISER_PROMPT, reviser_input)
+
+        return {"final": final, "draft": draft, "critique": critique,
+                "elapsed": time.time() - start, "error": None}
+    except Exception as e:
+        return {"final": None, "draft": None, "critique": None,
+                "elapsed": time.time() - start, "error": str(e)}
 
 
-st.caption("👤 " + signed_in_as())
+# ===========================================================================
+# UI
+# ===========================================================================
+st.set_page_config(page_title="Model Comparison — Research Pipeline",
+                   page_icon="⚖️", layout="wide")
+st.title("⚖️ Research Pipeline — Model Comparison")
+st.caption("Run the same question through several models side by side. "
+           "Each runs the Researcher → Critic → Reviser pipeline with web search + page fetch.")
 
 question = st.text_area(
-    "Ask a research question:",
-    placeholder="e.g. Is nuclear power a safe and viable way to reduce carbon emissions?",
-    height=100,
+    "Research question:",
+    placeholder="e.g. Do solar farms harm wildlife, and how can that be mitigated?",
+    height=90,
 )
 
-if st.button("Run pipeline", type="primary"):
+st.markdown("**Models to compare** (one slug per line). Browse slugs at "
+            "[openrouter.ai/models](https://openrouter.ai/models). "
+            "`openrouter/free` auto-picks a working free model; paid slugs need credits.")
+models_text = st.text_area(
+    "Models:",
+    value="openrouter/free\nopenai/gpt-oss-120b",
+    height=90,
+    label_visibility="collapsed",
+)
+
+col_a, col_b = st.columns([1, 2])
+with col_a:
+    full_pipeline = st.toggle("Full pipeline", value=False,
+                              help="On: Researcher→Critic→Reviser (slower, ~3x the calls). "
+                                   "Off: Researcher only (faster, good for quick comparisons).")
+with col_b:
+    st.caption("Tip: start with 'Researcher only' to compare quickly and save "
+               "quota. Each full-pipeline run is a dozen-plus API calls per model.")
+
+if st.button("Compare models", type="primary"):
     if not question.strip():
         st.warning("Please enter a question first.")
         st.stop()
 
-    # st.status shows a live, collapsible progress panel while agents work.
-    with st.status("Running the pipeline…", expanded=True) as status_box:
-        def show(msg):
-            status_box.write(msg)
+    models = [m.strip() for m in models_text.splitlines() if m.strip()]
+    if not models:
+        st.warning("Please enter at least one model slug.")
+        st.stop()
 
-        show("**Stage 1 — Researcher** drafting an answer…")
-        draft = run_agent_loop(RESEARCHER_PROMPT, question, use_tools=True,
-                               label="RESEARCHER", status=show)
+    st.divider()
+    columns = st.columns(len(models))
 
-        show("**Stage 2 — Critic** reviewing the draft…")
-        critic_input = f"QUESTION:\n{question}\n\nDRAFT ANSWER:\n{draft}"
-        critique = run_agent_loop(CRITIC_PROMPT, critic_input, use_tools=False,
-                                  label="CRITIC", status=show)
+    for col, model in zip(columns, models):
+        with col:
+            st.subheader(model)
+            with st.spinner(f"Running {model}…"):
+                result = run_for_model(model, question, full_pipeline=full_pipeline)
 
-        show("**Stage 3 — Reviser** producing the final answer…")
-        reviser_input = f"QUESTION:\n{question}\n\nYOUR DRAFT:\n{draft}\n\nCRITIQUE OF YOUR DRAFT:\n{critique}"
-        final = run_agent_loop(REVISER_PROMPT, reviser_input, use_tools=True,
-                               max_tokens=4000, label="REVISER", status=show)
+            if result["error"]:
+                st.error(f"Failed: {result['error']}")
+                continue
 
-        status_box.update(label="Done!", state="complete", expanded=False)
+            st.caption(f"⏱️ {result['elapsed']:.1f}s")
+            st.markdown(result["final"])
 
-    # Show the final answer prominently, with the intermediate stages tucked
-    # into expanders so you can inspect how the agents improved the answer.
-    st.subheader("Final answer")
-    st.markdown(final)
+            if full_pipeline and result["draft"] is not None:
+                with st.expander("First draft"):
+                    st.markdown(result["draft"])
+                with st.expander("Critique"):
+                    st.markdown(result["critique"])
 
-    with st.expander("See the researcher's first draft"):
-        st.markdown(draft)
-    with st.expander("See the critic's critique"):
-        st.markdown(critique)
+    st.divider()
+    st.caption("⚠️ Verify citations — smaller/free models sometimes fabricate "
+               "plausible-looking sources. Click each link to confirm it resolves.")
